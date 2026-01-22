@@ -4,11 +4,7 @@
 // UART Protocol (115200 baud, 8N1):
 //   RX: 4 bytes per event [X, Y, POL, TS_unused]
 //   TX: 1 byte when gesture detected [0xA0 | gesture]
-//
-// TEST MODE: Send 0xFF to get 0x55 back (verifies UART works)
-//
-// CRITICAL: Uses internal power-on reset (no external reset pin needed)
-// This matches the proven working design from jasonwaseq/fpga_sorting
+
 
 module uart_gesture_top #(
     parameter CLK_FREQ = 12_000_000,
@@ -27,11 +23,7 @@ module uart_gesture_top #(
 
     localparam CLKS_PER_BIT = CLK_FREQ / BAUD_RATE;
 
-    // =========================================================
-    // Power-on reset (synchronous, active-high)
-    // Same approach as proven working fpga_sorting design
     // Holds reset high for first 15 clock cycles
-    // =========================================================
     reg [3:0] por_cnt = 4'd0;
     wire      rst;
     
@@ -43,16 +35,13 @@ module uart_gesture_top #(
     end
     assign rst = ~&por_cnt;  // Active high reset for first 15 clocks
 
-    // UART RX signals
     logic [7:0] rx_data;
     logic rx_valid;
     
-    // UART TX signals
     logic [7:0] tx_data;
     logic tx_valid;
     logic tx_busy;
     
-    // Gesture output
     logic [1:0] gesture;
     logic gesture_valid;
     
@@ -86,7 +75,6 @@ module uart_gesture_top #(
     logic [6:0] event_x, event_y;
     logic event_polarity;
 
-    // UART Receiver (synchronous reset, active high)
     uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_uart_rx (
         .clk(clk),
         .rst(rst),
@@ -95,7 +83,6 @@ module uart_gesture_top #(
         .valid(rx_valid)
     );
     
-    // UART Transmitter (synchronous reset, active high)
     uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) u_uart_tx (
         .clk(clk),
         .rst(rst),
@@ -105,7 +92,6 @@ module uart_gesture_top #(
         .busy(tx_busy)
     );
 
-    // DVS Gesture Accelerator (synchronous reset, active high)
     dvs_gesture_accel #(
         .X_BITS(7),
         .Y_BITS(7),
@@ -124,7 +110,6 @@ module uart_gesture_top #(
     );
 
     // Main state machine - handles RX packets and TX responses
-    // SYNCHRONOUS reset (active high) - critical for iCE40
     always @(posedge clk) begin
         if (rst) begin
             byte_cnt <= 2'd0;

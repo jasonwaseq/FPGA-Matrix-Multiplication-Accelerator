@@ -2,7 +2,6 @@
 // Simple matrix multiplication accelerator for gesture recognition
 // Input: DVS events (x, y, polarity, timestamp)
 // Output: Gesture classification (UP, DOWN, LEFT, RIGHT)
-// Uses SYNCHRONOUS reset (active-high) for iCE40 compatibility
 
 module dvs_gesture_accel #(
     parameter X_BITS = 7,          // DVS128: 0-127

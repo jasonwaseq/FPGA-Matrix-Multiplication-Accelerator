@@ -1,7 +1,6 @@
 // Event Accumulator - Accumulates DVS events and computes center of mass
 // Input: DVS events (x, y, polarity)
 // Output: Delta movement (dx, dy) when triggered
-// Uses SYNCHRONOUS reset (active-high) for iCE40 compatibility
 
 module event_accumulator #(
     parameter X_BITS = 7,   // DVS128: 0-127
@@ -9,7 +8,7 @@ module event_accumulator #(
     parameter ACC_BITS = 16 // Accumulator width
 )(
     input  logic clk,
-    input  logic rst,       // Synchronous, active-high reset
+    input  logic rst,       
     
     // Event input
     input  logic event_valid,

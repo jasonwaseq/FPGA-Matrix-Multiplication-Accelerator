@@ -2,14 +2,13 @@
 // Multiplies movement vector [dx, dy] by 4x2 weight matrix
 // Outputs: 4 gesture scores (UP, DOWN, LEFT, RIGHT)
 // Gesture = argmax(scores)
-// Uses SYNCHRONOUS reset (active-high) for iCE40 compatibility
 
 module gesture_classifier #(
     parameter DATA_BITS = 16,
     parameter WEIGHT_BITS = 8
 )(
     input  logic clk,
-    input  logic rst,       // Synchronous, active-high reset
+    input  logic rst,      
     
     // Input: movement delta
     input  logic delta_valid,
