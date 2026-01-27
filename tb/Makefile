@@ -1,5 +1,5 @@
 # Makefile for cocotb testbench
-# DVS Gesture Accelerator with Temporal Voxel Binning
+# DVS Gesture Accelerator with Single Sliding-Window Ring Buffer
 
 TOPLEVEL_LANG = verilog
 VERILOG_SOURCES = $(wildcard ../rtl/*.sv)
@@ -12,6 +12,10 @@ SIM = icarus
 
 # Enable SystemVerilog
 COMPILE_ARGS += -g2012
+
+# Override CYCLES_PER_BIN for fast simulation
+# Use 600 cycles (enough for basic testing, classification will be truncated)
+COMPILE_ARGS += -Puart_gesture_top.CYCLES_PER_BIN=600
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
