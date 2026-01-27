@@ -1,4 +1,5 @@
 # Ice40 Synthesis Makefile for DVS Gesture Accelerator
+# Temporal Voxel Binning with 320x320 -> 16x16 spatial compression
 
 PROJ = uart_gesture_top
 PCF = icebreaker.pcf
@@ -8,12 +9,10 @@ PACKAGE = sg48
 RTL_DIR = ../rtl
 RTL_FILES = $(RTL_DIR)/uart_rx.sv \
             $(RTL_DIR)/uart_tx.sv \
-            $(RTL_DIR)/event_accumulator.sv \
-            $(RTL_DIR)/gesture_classifier.sv \
             $(RTL_DIR)/dvs_gesture_accel.sv \
             $(RTL_DIR)/uart_gesture_top.sv
 
-.PHONY: all clean prog
+.PHONY: all clean prog report
 
 all: $(PROJ).bit
 

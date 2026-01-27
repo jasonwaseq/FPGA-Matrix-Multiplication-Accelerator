@@ -1,11 +1,12 @@
 # Makefile for cocotb testbench
+# DVS Gesture Accelerator with Temporal Voxel Binning
 
 TOPLEVEL_LANG = verilog
 VERILOG_SOURCES = $(wildcard ../rtl/*.sv)
 
-# Default: test gesture accelerator core
-TOPLEVEL ?= dvs_gesture_accel
-MODULE ?= test_gesture
+# Default: test UART top module (full system)
+TOPLEVEL ?= uart_gesture_top
+MODULE ?= test_dvs_gesture
 
 SIM = icarus
 
@@ -15,10 +16,14 @@ COMPILE_ARGS += -g2012
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
 # Convenience targets
-.PHONY: test_core test_uart
+.PHONY: test test_full clean_all
 
-test_core:
-	$(MAKE) TOPLEVEL=dvs_gesture_accel MODULE=test_gesture
+test:
+	$(MAKE) TOPLEVEL=uart_gesture_top MODULE=test_dvs_gesture
 
-test_uart:
-	$(MAKE) TOPLEVEL=uart_gesture_top MODULE=test_uart_top
+test_full:
+	$(MAKE) clean
+	$(MAKE) test
+
+clean_all:
+	rm -rf sim_build results.xml __pycache__
