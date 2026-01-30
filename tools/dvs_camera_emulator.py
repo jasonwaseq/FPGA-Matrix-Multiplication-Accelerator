@@ -50,9 +50,17 @@ except ImportError:
 # =============================================================================
 
 DVS_RESOLUTION = 320  # Target resolution (matches SENSOR_RES in RTL)
-DEFAULT_THRESHOLD = 15  # Log intensity change threshold (in 8-bit units)
-DEFAULT_REFRACTORY_US = 1000  # Minimum time between events at same pixel
+# Real DVS contrast threshold is typically 15-20% relative intensity change
+# log(1.15) ≈ 0.14, log(1.20) ≈ 0.18
+DEFAULT_CONTRAST_THRESHOLD = 0.15  # Contrast threshold (log-domain, ~15% change)
+DEFAULT_THRESHOLD = 15  # Legacy: Log intensity change threshold (in 8-bit units)
+DEFAULT_REFRACTORY_US = 1000  # Minimum time between events at same pixel (real DVS: 1-10ms)
 DEFAULT_FPS = 30  # Camera capture FPS
+
+# Realistic DVS noise parameters (based on DVS346/DAVIS346 specifications)
+DEFAULT_LEAK_RATE = 0.001  # Reference voltage leak per second (causes background activity)
+DEFAULT_SHOT_NOISE_RATE = 0.0001  # Probability of noise event per pixel per frame
+DEFAULT_HOT_PIXEL_RATE = 0.00005  # Fraction of "hot" pixels with elevated noise
 
 
 # =============================================================================
@@ -185,12 +193,18 @@ class DVSCameraEmulator:
     """
     Emulates a Dynamic Vision Sensor using a standard webcam.
     
-    The DVS emulation works by:
-    1. Capturing frames from the webcam
-    2. Converting to grayscale and computing log intensity
-    3. Comparing consecutive frames to detect intensity changes
-    4. Generating ON events (polarity=1) where brightness increased
-    5. Generating OFF events (polarity=0) where brightness decreased
+    The DVS emulation models real DVS pixel behavior:
+    1. Each pixel maintains a reference log-intensity value
+    2. When current log-intensity differs from reference by > threshold, an event fires
+    3. Upon event firing, the reference is updated (not the entire frame)
+    4. Refractory period prevents rapid re-firing of the same pixel
+    5. Background activity noise simulates real sensor noise characteristics
+    
+    Key DVS physics modeled:
+    - Temporal contrast: fires when log(I_current) - log(I_ref) > θ (ON) or < -θ (OFF)
+    - Per-pixel reference tracking (like real DVS photoreceptor memory)
+    - Leak current causing reference drift
+    - Shot noise and hot pixel effects
     """
     
     def __init__(
@@ -198,30 +212,55 @@ class DVSCameraEmulator:
         camera_id: int = 0,
         output_resolution: int = DVS_RESOLUTION,
         threshold: float = DEFAULT_THRESHOLD,
+        contrast_threshold: float = DEFAULT_CONTRAST_THRESHOLD,
         refractory_period_us: int = DEFAULT_REFRACTORY_US,
         fps: int = DEFAULT_FPS,
-        noise_filter_size: int = 3
+        noise_filter_size: int = 3,
+        enable_noise_model: bool = True,
+        leak_rate: float = DEFAULT_LEAK_RATE,
+        shot_noise_rate: float = DEFAULT_SHOT_NOISE_RATE,
+        hot_pixel_rate: float = DEFAULT_HOT_PIXEL_RATE,
+        use_log_threshold: bool = True  # Use realistic log-domain threshold
     ):
         self.camera_id = camera_id
         self.output_resolution = output_resolution
-        self.threshold = threshold
+        self.threshold = threshold  # Legacy threshold (scaled difference)
+        self.contrast_threshold = contrast_threshold  # Realistic log-domain threshold
         self.refractory_period_us = refractory_period_us
         self.target_fps = fps
         self.noise_filter_size = noise_filter_size
+        self.use_log_threshold = use_log_threshold
+        
+        # Noise model parameters
+        self.enable_noise_model = enable_noise_model
+        self.leak_rate = leak_rate
+        self.shot_noise_rate = shot_noise_rate
+        self.hot_pixel_rate = hot_pixel_rate
         
         # Camera capture
         self.cap: Optional[cv2.VideoCapture] = None
-        self.prev_log_frame: Optional[np.ndarray] = None
+        
+        # Per-pixel reference memory (like real DVS photoreceptor voltage)
+        # This is NOT the previous frame - it's updated only when events fire
+        self.reference_log_intensity: Optional[np.ndarray] = None
         self.last_event_time: Optional[np.ndarray] = None
+        
+        # Legacy: previous frame (for comparison)
+        self.prev_log_frame: Optional[np.ndarray] = None
+        
+        # Hot pixel map (random pixels with elevated noise)
+        self.hot_pixel_mask: Optional[np.ndarray] = None
         
         # Timing
         self.start_time_us = 0
+        self.last_frame_time_us = 0
         self.frame_count = 0
         
         # Event statistics
         self.total_events = 0
         self.on_events = 0
         self.off_events = 0
+        self.noise_events = 0
     
     def open_camera(self) -> bool:
         """Initialize the webcam capture"""
@@ -244,15 +283,40 @@ class DVSCameraEmulator:
         
         print(f"Camera opened: {actual_width}x{actual_height} @ {actual_fps:.1f} FPS")
         print(f"Output resolution: {self.output_resolution}x{self.output_resolution}")
-        print(f"Threshold: {self.threshold}, Refractory: {self.refractory_period_us}μs")
+        if self.use_log_threshold:
+            print(f"Contrast threshold: {self.contrast_threshold:.2f} ({self.contrast_threshold*100:.0f}% intensity change)")
+        else:
+            print(f"Threshold (legacy): {self.threshold}")
+        print(f"Refractory period: {self.refractory_period_us}μs")
+        print(f"Noise model: {'ENABLED' if self.enable_noise_model else 'DISABLED'}")
         
-        # Initialize tracking arrays
-        self.last_event_time = np.zeros(
-            (self.output_resolution, self.output_resolution), dtype=np.int64
-        )
-        self.start_time_us = int(time.time() * 1_000_000)
+        self._initialize_pixel_state()
         
         return True
+    
+    def _initialize_pixel_state(self):
+        """Initialize per-pixel state arrays"""
+        shape = (self.output_resolution, self.output_resolution)
+        
+        # Per-pixel reference log-intensity (starts as None, initialized on first frame)
+        self.reference_log_intensity = None
+        
+        # Last event time per pixel
+        self.last_event_time = np.zeros(shape, dtype=np.int64)
+        
+        # Hot pixel mask - random pixels with elevated noise probability
+        if self.enable_noise_model:
+            num_hot_pixels = int(self.output_resolution * self.output_resolution * self.hot_pixel_rate)
+            self.hot_pixel_mask = np.zeros(shape, dtype=bool)
+            hot_indices = np.random.choice(
+                self.output_resolution * self.output_resolution,
+                size=num_hot_pixels,
+                replace=False
+            )
+            self.hot_pixel_mask.flat[hot_indices] = True
+        
+        self.start_time_us = int(time.time() * 1_000_000)
+        self.last_frame_time_us = self.start_time_us
     
     def close_camera(self):
         """Release camera resources"""
@@ -285,39 +349,117 @@ class DVSCameraEmulator:
         
         # Convert to log intensity (add 1 to avoid log(0))
         # Use float32 for precision
+        # Real DVS uses natural log of photocurrent which is proportional to intensity
         log_frame = np.log(resized.astype(np.float32) + 1.0)
         
         return log_frame
     
-    def process_frame(self, frame: np.ndarray) -> List[DVSEvent]:
+    def _apply_reference_leak(self, dt_seconds: float):
         """
-        Process a camera frame and generate DVS events.
+        Apply reference voltage leak to simulate real DVS pixel behavior.
         
-        Returns a list of DVSEvent objects for pixels that changed
-        beyond the threshold since the last frame.
+        Real DVS pixels have capacitors that slowly leak, causing the reference
+        voltage to drift. This can trigger spurious events even without scene changes.
         """
-        current_time_us = int(time.time() * 1_000_000) - self.start_time_us
+        if self.reference_log_intensity is None or not self.enable_noise_model:
+            return
         
-        # Preprocess frame
-        log_frame = self._preprocess_frame(frame)
+        # Reference leaks toward current mean illumination (simplified model)
+        # In real DVS, leak is toward reset voltage which depends on bias settings
+        leak_amount = self.leak_rate * dt_seconds
+        mean_log = np.mean(self.reference_log_intensity)
         
-        # First frame - no events, just store reference
-        if self.prev_log_frame is None:
-            self.prev_log_frame = log_frame
+        # Drift reference toward mean
+        self.reference_log_intensity += leak_amount * (mean_log - self.reference_log_intensity)
+    
+    def _generate_noise_events(self, current_time_us: int) -> List['DVSEvent']:
+        """
+        Generate background activity noise events.
+        
+        Real DVS sensors have background activity due to:
+        - Shot noise in photocurrent
+        - Thermal noise in transistors  
+        - Hot pixels (defective pixels with elevated noise)
+        """
+        if not self.enable_noise_model:
             return []
         
-        # Compute intensity difference
-        diff = log_frame - self.prev_log_frame
+        noise_events = []
         
-        # Scale diff to roughly match 8-bit threshold
-        # log(255) - log(1) ≈ 5.5, so scale factor ~46
-        diff_scaled = diff * 46.0
+        # Shot noise: random events across all pixels
+        noise_mask = np.random.random((self.output_resolution, self.output_resolution)) < self.shot_noise_rate
+        
+        # Hot pixels have 10x higher noise rate
+        hot_noise_mask = np.random.random((self.output_resolution, self.output_resolution)) < (self.shot_noise_rate * 10)
+        noise_mask = noise_mask | (self.hot_pixel_mask & hot_noise_mask)
+        
+        # Check refractory period
+        time_since_last = current_time_us - self.last_event_time
+        refractory_mask = time_since_last >= self.refractory_period_us
+        noise_mask = noise_mask & refractory_mask
+        
+        # Generate noise events with random polarity
+        noise_coords = np.argwhere(noise_mask)
+        for y, x in noise_coords:
+            polarity = np.random.random() > 0.5  # Random polarity
+            event = DVSEvent(
+                x=int(x),
+                y=int(y),
+                polarity=polarity,
+                timestamp_us=current_time_us
+            )
+            noise_events.append(event)
+            self.last_event_time[y, x] = current_time_us
+            self.noise_events += 1
+        
+        return noise_events
+    
+    def process_frame(self, frame: np.ndarray) -> List[DVSEvent]:
+        """
+        Process a camera frame and generate DVS events using realistic pixel model.
+        
+        Real DVS pixel model:
+        1. Each pixel compares current log-intensity to its stored reference
+        2. If difference exceeds threshold: fire event and UPDATE REFERENCE
+        3. Reference is only updated for pixels that fire (not all pixels)
+        4. Refractory period prevents immediate re-firing
+        
+        Returns a list of DVSEvent objects for pixels that changed
+        beyond the threshold since their last event.
+        """
+        current_time_us = int(time.time() * 1_000_000) - self.start_time_us
+        dt_seconds = (current_time_us - self.last_frame_time_us) / 1_000_000.0
+        
+        # Preprocess frame to log-intensity
+        log_frame = self._preprocess_frame(frame)
+        
+        # First frame - initialize reference and return no events
+        if self.reference_log_intensity is None:
+            self.reference_log_intensity = log_frame.copy()
+            self.prev_log_frame = log_frame  # Keep for legacy mode
+            self.last_frame_time_us = current_time_us
+            return []
+        
+        # Apply reference leak (realistic DVS behavior)
+        self._apply_reference_leak(dt_seconds)
         
         events = []
         
-        # Find pixels that changed beyond threshold
-        on_mask = diff_scaled > self.threshold
-        off_mask = diff_scaled < -self.threshold
+        if self.use_log_threshold:
+            # REALISTIC MODE: Use per-pixel reference with contrast threshold
+            # Compare current intensity to per-pixel reference (not previous frame!)
+            diff = log_frame - self.reference_log_intensity
+            
+            # Find pixels that exceed contrast threshold
+            on_mask = diff > self.contrast_threshold
+            off_mask = diff < -self.contrast_threshold
+        else:
+            # LEGACY MODE: Compare consecutive frames with scaled threshold
+            diff = log_frame - self.prev_log_frame
+            diff_scaled = diff * 46.0  # Scale to roughly match 8-bit threshold
+            
+            on_mask = diff_scaled > self.threshold
+            off_mask = diff_scaled < -self.threshold
         
         # Apply refractory period filter
         time_since_last = current_time_us - self.last_event_time
@@ -337,6 +479,8 @@ class DVSCameraEmulator:
             )
             events.append(event)
             self.last_event_time[y, x] = current_time_us
+            # CRITICAL: Update reference only for pixels that fired
+            self.reference_log_intensity[y, x] = log_frame[y, x]
             self.on_events += 1
         
         # Generate OFF events (brightness decreased)
@@ -350,12 +494,19 @@ class DVSCameraEmulator:
             )
             events.append(event)
             self.last_event_time[y, x] = current_time_us
+            # CRITICAL: Update reference only for pixels that fired
+            self.reference_log_intensity[y, x] = log_frame[y, x]
             self.off_events += 1
         
-        # Update reference frame
+        # Generate background noise events (realistic DVS behavior)
+        noise_events = self._generate_noise_events(current_time_us)
+        events.extend(noise_events)
+        
+        # Update state for next frame
         self.prev_log_frame = log_frame
         self.total_events += len(events)
         self.frame_count += 1
+        self.last_frame_time_us = current_time_us
         
         return events
     
@@ -377,6 +528,7 @@ class DVSCameraEmulator:
             'total_events': self.total_events,
             'on_events': self.on_events,
             'off_events': self.off_events,
+            'noise_events': self.noise_events,
             'frame_count': self.frame_count,
             'events_per_frame': self.total_events / max(1, self.frame_count)
         }
@@ -638,7 +790,9 @@ Examples:
     parser.add_argument('--baud', type=int, default=115200,
                         help='UART baud rate (default: 115200)')
     parser.add_argument('--threshold', type=float, default=DEFAULT_THRESHOLD,
-                        help=f'Event threshold (default: {DEFAULT_THRESHOLD})')
+                        help=f'Event threshold - legacy mode (default: {DEFAULT_THRESHOLD})')
+    parser.add_argument('--contrast', type=float, default=DEFAULT_CONTRAST_THRESHOLD,
+                        help=f'Contrast threshold - realistic log-domain (default: {DEFAULT_CONTRAST_THRESHOLD}, ~15%% change)')
     parser.add_argument('--refractory', type=int, default=DEFAULT_REFRACTORY_US,
                         help=f'Refractory period in μs (default: {DEFAULT_REFRACTORY_US})')
     parser.add_argument('--resolution', type=int, default=DVS_RESOLUTION,
@@ -655,6 +809,14 @@ Examples:
                         help='Maximum events per frame to send (default: 1000)')
     parser.add_argument('--loop', action='store_true',
                         help='Loop video file playback')
+    parser.add_argument('--legacy-mode', action='store_true',
+                        help='Use legacy frame-difference mode instead of realistic per-pixel reference')
+    parser.add_argument('--no-noise', action='store_true',
+                        help='Disable background noise model')
+    parser.add_argument('--leak-rate', type=float, default=DEFAULT_LEAK_RATE,
+                        help=f'Reference leak rate per second (default: {DEFAULT_LEAK_RATE})')
+    parser.add_argument('--shot-noise', type=float, default=DEFAULT_SHOT_NOISE_RATE,
+                        help=f'Shot noise probability per pixel per frame (default: {DEFAULT_SHOT_NOISE_RATE})')
     
     args = parser.parse_args()
     
@@ -674,22 +836,28 @@ Examples:
         camera_id=args.camera,
         output_resolution=args.resolution,
         threshold=args.threshold,
+        contrast_threshold=args.contrast,
         refractory_period_us=args.refractory,
         fps=args.fps,
-        noise_filter_size=args.noise_filter if args.noise_filter > 0 else 1
+        noise_filter_size=args.noise_filter if args.noise_filter > 0 else 1,
+        enable_noise_model=not args.no_noise,
+        leak_rate=args.leak_rate,
+        shot_noise_rate=args.shot_noise,
+        use_log_threshold=not args.legacy_mode
     )
     
     if use_simulator:
         print("Mode: SIMULATION (synthetic gestures)")
         print(f"Resolution: {args.resolution}x{args.resolution}")
-        print(f"Threshold: {args.threshold}")
+        if args.legacy_mode:
+            print(f"Threshold (legacy): {args.threshold}")
+        else:
+            print(f"Contrast threshold: {args.contrast:.2f} (~{args.contrast*100:.0f}% intensity change)")
+        print(f"Noise model: {'DISABLED' if args.no_noise else 'ENABLED'}")
         print()
         simulator = GestureSimulator(args.resolution, args.fps)
         # Initialize emulator tracking arrays without opening camera
-        emulator.last_event_time = np.zeros(
-            (args.resolution, args.resolution), dtype=np.int64
-        )
-        emulator.start_time_us = int(time.time() * 1_000_000)
+        emulator._initialize_pixel_state()
     elif use_video:
         print(f"Mode: VIDEO FILE ({args.video})")
         video_cap = cv2.VideoCapture(args.video)
@@ -704,14 +872,15 @@ Examples:
         video_height = int(video_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"Video: {video_width}x{video_height} @ {video_fps:.1f} FPS, {video_frames} frames")
         print(f"Output resolution: {args.resolution}x{args.resolution}")
-        print(f"Threshold: {args.threshold}")
+        if args.legacy_mode:
+            print(f"Threshold (legacy): {args.threshold}")
+        else:
+            print(f"Contrast threshold: {args.contrast:.2f} (~{args.contrast*100:.0f}% intensity change)")
+        print(f"Noise model: {'DISABLED' if args.no_noise else 'ENABLED'}")
         print()
         
         # Initialize emulator tracking arrays without opening camera
-        emulator.last_event_time = np.zeros(
-            (args.resolution, args.resolution), dtype=np.int64
-        )
-        emulator.start_time_us = int(time.time() * 1_000_000)
+        emulator._initialize_pixel_state()
     else:
         print("Mode: CAMERA")
         if not emulator.open_camera():
@@ -740,9 +909,10 @@ Examples:
     print()
     print("Controls:")
     print("  q     - Quit")
-    print("  +/-   - Adjust threshold")
+    print("  +/-   - Adjust contrast threshold")
     print("  r     - Reset statistics")
     print("  Space - Pause/Resume")
+    print("  n     - Toggle noise model")
     if use_simulator:
         print("  1-4   - Trigger gesture (1=UP, 2=DOWN, 3=LEFT, 4=RIGHT)")
     print()
@@ -824,15 +994,27 @@ Examples:
                 if key == ord('q'):
                     break
                 elif key == ord('+') or key == ord('='):
-                    emulator.threshold += 2
-                    print(f"Threshold: {emulator.threshold}")
+                    if emulator.use_log_threshold:
+                        emulator.contrast_threshold += 0.02
+                        print(f"Contrast threshold: {emulator.contrast_threshold:.2f} (~{emulator.contrast_threshold*100:.0f}%)")
+                    else:
+                        emulator.threshold += 2
+                        print(f"Threshold: {emulator.threshold}")
                 elif key == ord('-'):
-                    emulator.threshold = max(1, emulator.threshold - 2)
-                    print(f"Threshold: {emulator.threshold}")
+                    if emulator.use_log_threshold:
+                        emulator.contrast_threshold = max(0.02, emulator.contrast_threshold - 0.02)
+                        print(f"Contrast threshold: {emulator.contrast_threshold:.2f} (~{emulator.contrast_threshold*100:.0f}%)")
+                    else:
+                        emulator.threshold = max(1, emulator.threshold - 2)
+                        print(f"Threshold: {emulator.threshold}")
+                elif key == ord('n'):
+                    emulator.enable_noise_model = not emulator.enable_noise_model
+                    print(f"Noise model: {'ENABLED' if emulator.enable_noise_model else 'DISABLED'}")
                 elif key == ord('r'):
                     emulator.total_events = 0
                     emulator.on_events = 0
                     emulator.off_events = 0
+                    emulator.noise_events = 0
                     emulator.frame_count = 0
                     print("Statistics reset")
                 elif key == ord(' '):
@@ -871,6 +1053,7 @@ Examples:
         print(f"  Total Events: {stats['total_events']}")
         print(f"  ON Events:    {stats['on_events']}")
         print(f"  OFF Events:   {stats['off_events']}")
+        print(f"  Noise Events: {stats['noise_events']}")
         print(f"  Frames:       {stats['frame_count']}")
         
         if uart_handler:

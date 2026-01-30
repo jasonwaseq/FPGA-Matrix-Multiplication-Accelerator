@@ -1,5 +1,5 @@
 # Pin constraints for iCEBreaker FPGA board
-# DVS Gesture Accelerator with Temporal Voxel Binning
+# DVS Gesture Accelerator - Asynchronous Spatiotemporal Motion-Energy Classifier
 #
 # CRITICAL: Uses internal power-on reset - no external reset pin needed
 # This matches the proven working design pattern
@@ -16,3 +16,4 @@ set_io uart_tx 9
 # Debug LEDs (accent LEDs, active low on iCEBreaker)
 set_io led_heartbeat 39
 set_io led_gesture_valid 40
+set_io led_activity 41

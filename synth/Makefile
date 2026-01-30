@@ -1,5 +1,6 @@
 # Ice40 Synthesis Makefile for DVS Gesture Accelerator
-# Temporal Voxel Binning with 320x320 -> 16x16 spatial compression
+# Asynchronous Spatiotemporal Motion-Energy Classifier
+# 320x320 -> 16x16 spatial compression with dual-accumulator architecture
 
 PROJ = uart_gesture_top
 PCF = icebreaker.pcf
@@ -12,7 +13,7 @@ RTL_FILES = $(RTL_DIR)/uart_rx.sv \
             $(RTL_DIR)/dvs_gesture_accel.sv \
             $(RTL_DIR)/uart_gesture_top.sv
 
-.PHONY: all clean prog report
+.PHONY: all clean prog report timing
 
 all: $(PROJ).bit
 
@@ -26,7 +27,7 @@ $(PROJ).json: $(PROJ).v
 
 # Place and Route
 $(PROJ).asc: $(PROJ).json $(PCF)
-	nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json $< --pcf $(PCF) --asc $@
+	nextpnr-ice40 --$(DEVICE) --package $(PACKAGE) --json $< --pcf $(PCF) --asc $@ --freq 12
 
 # Bitstream generation
 $(PROJ).bit: $(PROJ).asc
@@ -40,5 +41,10 @@ prog: $(PROJ).bit
 report: $(PROJ).json
 	yosys -p "read_json $<; stat"
 
+# Timing analysis
+timing: $(PROJ).asc
+	icetime -d $(DEVICE) -m -r $(PROJ).timing $<
+	@echo "Timing report saved to $(PROJ).timing"
+
 clean:
-	rm -f $(PROJ).v $(PROJ).json $(PROJ).asc $(PROJ).bit
+	rm -f $(PROJ).v $(PROJ).json $(PROJ).asc $(PROJ).bit $(PROJ).timing

@@ -6,11 +6,37 @@ This directory contains tools for emulating a Dynamic Vision Sensor (DVS) using 
 
 Dynamic Vision Sensors (DVS) are neuromorphic cameras that detect changes in pixel intensity asynchronously, outputting events only when brightness changes beyond a threshold. This is fundamentally different from traditional frame-based cameras.
 
-These tools convert webcam frames into DVS-like events by:
-1. Computing log intensity of consecutive frames
-2. Detecting pixels where intensity changed beyond a threshold
-3. Generating ON events (brightness increased) and OFF events (brightness decreased)
-4. Transmitting events via UART to the FPGA
+### How Real DVS Sensors Work
+
+Real DVS pixels operate independently and asynchronously:
+1. Each pixel maintains a **reference voltage** proportional to log-intensity
+2. When current log-intensity differs from reference by a threshold θ, an event fires
+3. **Only the pixel that fires** updates its reference (not neighboring pixels)
+4. A **refractory period** prevents immediate re-firing of the same pixel
+5. Events have **microsecond-level timestamps** (true asynchronous operation)
+
+### How This Emulator Models DVS Behavior
+
+This emulator converts webcam frames into realistic DVS-like events by:
+1. Computing log intensity of each frame
+2. Maintaining a **per-pixel reference memory** (like real DVS photoreceptors)
+3. Detecting pixels where log-intensity change exceeds the contrast threshold
+4. Generating ON events (brightness increased) and OFF events (brightness decreased)
+5. Updating reference **only for pixels that fired** (realistic behavior)
+6. Applying **refractory period** to prevent rapid re-firing
+7. Optionally adding **background noise** (shot noise, hot pixels, reference leak)
+
+## Realism Features
+
+| Feature | Description | Real DVS Behavior |
+|---------|-------------|-------------------|
+| Per-pixel reference | Each pixel tracks its own reference intensity | ✓ Matches DVS photoreceptor memory |
+| Contrast threshold | Log-domain threshold (~15% intensity change) | ✓ Matches DVS temporal contrast |
+| Selective reference update | Only pixels that fire update their reference | ✓ Critical for accurate edge detection |
+| Refractory period | Minimum 1ms between events at same pixel | ✓ Models DVS pixel reset time |
+| Reference leak | Reference slowly drifts over time | ✓ Models capacitor leak in real pixels |
+| Shot noise | Random background events | ✓ Models photocurrent noise |
+| Hot pixels | Some pixels have elevated noise | ✓ Models manufacturing defects |
 
 ## Files
 
@@ -23,7 +49,7 @@ These tools convert webcam frames into DVS-like events by:
 
 ```bash
 # Ubuntu/Debian - install all dependencies system-wide
-sudo apt install python3-opencv python3-serial
+sudo apt install python3-opencv python3-serial python3-numpy
 
 # That's it! No virtual environment needed.
 ```
@@ -35,18 +61,13 @@ pip install opencv-python numpy pyserial
 
 ## Usage
 
-### DVS Camera Emulator
+### Quick Start Examples
 
 **Simulation mode (no camera required - great for testing):**
 ```bash
 python dvs_camera_emulator.py --simulate --preview
 ```
 Press keys 1-4 to trigger gestures (UP/DOWN/LEFT/RIGHT).
-
-**Use a video file as input:**
-```bash
-python dvs_camera_emulator.py --video gesture_video.mp4 --preview
-```
 
 **Preview mode with camera:**
 ```bash
@@ -58,31 +79,132 @@ python dvs_camera_emulator.py --preview
 # Linux
 python dvs_camera_emulator.py --port /dev/ttyUSB0 --preview
 
-# Windows
+# Windows  
 python dvs_camera_emulator.py --port COM3 --preview
 
 # macOS
 python dvs_camera_emulator.py --port /dev/cu.usbserial-* --preview
 ```
 
-**Save events to file for later replay:**
+### Input Sources
+
+**Use webcam (default):**
+```bash
+python dvs_camera_emulator.py --preview
+python dvs_camera_emulator.py --camera 1 --preview  # Use camera ID 1
+```
+
+**Use a video file as input:**
+```bash
+python dvs_camera_emulator.py --video gesture_video.mp4 --preview
+python dvs_camera_emulator.py --video gesture_video.mp4 --loop --preview  # Loop playback
+```
+
+**Simulation mode (synthetic gestures):**
+```bash
+python dvs_camera_emulator.py --simulate --preview
+```
+
+### Threshold & Sensitivity
+
+The emulator supports two threshold modes:
+
+**Realistic contrast threshold (default):**
+```bash
+# Default 15% contrast threshold (0.15 in log domain)
+python dvs_camera_emulator.py --preview
+
+# More sensitive (detects ~10% intensity changes)
+python dvs_camera_emulator.py --contrast 0.10 --preview
+
+# Less sensitive (detects ~25% intensity changes)
+python dvs_camera_emulator.py --contrast 0.25 --preview
+```
+
+**Legacy threshold mode:**
+```bash
+# Use original frame-difference algorithm
+python dvs_camera_emulator.py --legacy-mode --threshold 15 --preview
+python dvs_camera_emulator.py --legacy-mode --threshold 10 --preview  # More sensitive
+python dvs_camera_emulator.py --legacy-mode --threshold 25 --preview  # Less sensitive
+```
+
+### Noise Model
+
+Control the realistic noise simulation:
+
+```bash
+# Disable noise for clean output
+python dvs_camera_emulator.py --no-noise --preview
+
+# Adjust noise parameters
+python dvs_camera_emulator.py --leak-rate 0.002 --preview  # More reference drift
+python dvs_camera_emulator.py --shot-noise 0.0005 --preview  # More background noise
+```
+
+### Output Options
+
+**Save events to file:**
 ```bash
 python dvs_camera_emulator.py --save recording.bin --preview
 ```
 
-**Adjust sensitivity:**
+**Send to FPGA via UART:**
 ```bash
-# More sensitive (detects smaller changes)
-python dvs_camera_emulator.py --threshold 10 --preview
-
-# Less sensitive (only large changes)
-python dvs_camera_emulator.py --threshold 25 --preview
+python dvs_camera_emulator.py --port /dev/ttyUSB0 --baud 115200 --preview
 ```
 
-**All options:**
+**Limit events per frame (prevent UART overflow):**
+```bash
+python dvs_camera_emulator.py --port /dev/ttyUSB0 --max-events 500 --preview
+```
+
+### Advanced Options
+
+**Adjust timing:**
+```bash
+python dvs_camera_emulator.py --fps 60 --preview  # Higher frame rate
+python dvs_camera_emulator.py --refractory 2000 --preview  # 2ms refractory period
+```
+
+**Noise filtering:**
+```bash
+python dvs_camera_emulator.py --noise-filter 5 --preview  # Stronger Gaussian blur
+python dvs_camera_emulator.py --noise-filter 0 --preview  # Disable blur
+```
+
+**Change resolution:**
+```bash
+python dvs_camera_emulator.py --resolution 128 --preview  # Lower resolution
+```
+
+### Complete Options Reference
+
 ```bash
 python dvs_camera_emulator.py --help
 ```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--camera` | 0 | Camera device ID |
+| `--video` | None | Video file input instead of camera |
+| `--simulate` | False | Simulate gestures without camera |
+| `--port` | None | Serial port for UART output |
+| `--baud` | 115200 | UART baud rate |
+| `--contrast` | 0.15 | Contrast threshold (log-domain, ~15% change) |
+| `--threshold` | 15 | Legacy threshold (scaled difference) |
+| `--legacy-mode` | False | Use legacy frame-difference algorithm |
+| `--refractory` | 1000 | Refractory period in μs |
+| `--resolution` | 320 | Output resolution |
+| `--fps` | 30 | Target frame rate |
+| `--preview` | False | Show preview window |
+| `--save` | None | Save events to binary file |
+| `--noise-filter` | 3 | Gaussian blur kernel size |
+| `--max-events` | 1000 | Max events per frame to send |
+| `--loop` | False | Loop video file playback |
+| `--no-noise` | False | Disable background noise model |
+| `--leak-rate` | 0.001 | Reference leak rate per second |
+| `--shot-noise` | 0.0001 | Shot noise probability per pixel per frame |
 
 ### Event Player
 
@@ -110,9 +232,14 @@ python dvs_event_player.py recording.bin --port /dev/ttyUSB0 --loop
 | Key | Action |
 |-----|--------|
 | `q` | Quit |
-| `+` / `-` | Increase / decrease threshold |
+| `+` / `-` | Increase / decrease contrast threshold |
 | `r` | Reset statistics |
 | `Space` | Pause / resume |
+| `n` | Toggle noise model on/off |
+| `1` | Trigger UP gesture (simulation mode) |
+| `2` | Trigger DOWN gesture (simulation mode) |
+| `3` | Trigger LEFT gesture (simulation mode) |
+| `4` | Trigger RIGHT gesture (simulation mode) |
 
 ## UART Protocol
 
@@ -128,12 +255,40 @@ Events are sent as 5 bytes matching the `uart_gesture_top.sv` protocol:
 
 Coordinates range from 0-319 to match the 320x320 sensor resolution.
 
+## Understanding DVS Events
+
+### ON vs OFF Events
+
+- **ON events** (polarity=1, shown in **blue**): Pixel brightness increased
+- **OFF events** (polarity=0, shown in **red**): Pixel brightness decreased
+
+### What Generates Events
+
+| Motion | Leading Edge | Trailing Edge |
+|--------|--------------|---------------|
+| Bright object on dark background | ON events | OFF events |
+| Dark object on bright background | OFF events | ON events |
+| Moving texture | Mixed ON/OFF | Mixed ON/OFF |
+
+### Contrast Threshold Explained
+
+The contrast threshold θ determines sensitivity. Real DVS fires when:
+
+$$\log(I_{current}) - \log(I_{reference}) > \theta$$
+
+| Threshold | % Intensity Change | Use Case |
+|-----------|-------------------|----------|
+| 0.10 | ~10% | High sensitivity, more noise |
+| 0.15 | ~15% | Default, balanced |
+| 0.20 | ~22% | Less sensitive |
+| 0.30 | ~35% | Only strong edges |
+
 ## Tips for Best Results
 
-1. **Lighting**: Consistent, even lighting produces cleaner events. Avoid direct sunlight or flickering lights.
+1. **Lighting**: Consistent, even lighting produces cleaner events. Avoid direct sunlight or flickering lights (60Hz flicker can cause noise).
 
 2. **Threshold tuning**: 
-   - Start with default threshold (15)
+   - Start with default contrast (0.15)
    - Lower values = more events, may include noise
    - Higher values = fewer events, misses subtle motion
 
@@ -145,6 +300,8 @@ Coordinates range from 0-319 to match the 320x320 sensor resolution.
    - Move hand across camera view in clear UP/DOWN/LEFT/RIGHT motions
    - Speed should be moderate (not too fast or slow)
    - Cover ~1/3 to 1/2 of the frame with your gesture
+
+6. **Noise model**: Enable noise (`--no-noise` to disable) for realistic testing, but disable it if you need clean ground-truth events.
 
 ## Event File Format
 
@@ -162,15 +319,18 @@ All values are little-endian.
 **No camera found:**
 - Check camera is connected and not in use by another application
 - Try different camera ID: `--camera 1`
+- Use simulation mode instead: `--simulate`
 
 **No events generated:**
-- Lower threshold: `--threshold 10`
+- Lower contrast threshold: `--contrast 0.08`
 - Add more motion in front of camera
 - Check camera is not covered or in complete darkness
+- Try legacy mode: `--legacy-mode --threshold 10`
 
 **Too many events (noisy):**
-- Increase threshold: `--threshold 25`
-- Enable noise filter: `--noise-filter 5`
+- Increase contrast threshold: `--contrast 0.25`
+- Enable/increase noise filter: `--noise-filter 5`
+- Disable noise model: `--no-noise`
 - Improve lighting conditions
 
 **UART connection issues:**
@@ -178,3 +338,20 @@ All values are little-endian.
 - Check baud rate matches FPGA (115200)
 - Ensure FPGA is programmed and running
 - Test with echo command: send `0xFF`, should receive `0x55`
+
+**Events look different from real DVS:**
+- Use realistic mode (not `--legacy-mode`)
+- Enable noise model (remove `--no-noise`)
+- Adjust contrast threshold to match your DVS sensor's settings
+
+## Limitations vs Real DVS
+
+| Aspect | This Emulator | Real DVS |
+|--------|---------------|----------|
+| Temporal resolution | Frame-based (~33ms) | Microsecond-level |
+| Event timing | Same timestamp per frame | True asynchronous |
+| Dynamic range | 8-bit camera | 120+ dB |
+| Latency | ~50-100ms | <1ms |
+| Power | Full camera + PC | <10mW |
+
+For highest accuracy testing, consider using real DVS recordings from public datasets like [DVS-Gesture](https://research.ibm.com/interactive/dvsgesture/) or [DDD17](https://docs.prophesee.ai/).

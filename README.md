@@ -1,6 +1,18 @@
-# DVS Gesture Accelerator with Temporal Voxel Binning
+# DVS Gesture Accelerator - Asynchronous Spatiotemporal Motion-Energy Classifier
 
-FPGA-based gesture recognition accelerator for Dynamic Vision Sensor (DVS) events on iCE40 UP5K.
+FPGA-based real-time gesture recognition accelerator for Dynamic Vision Sensor (DVS) events on iCE40 UP5K.
+
+## Features
+
+- **Asynchronous Event-Driven Processing**: Each DVS event processed individually as it arrives
+- **Shallow FIFO Buffer**: 16-entry FIFO tolerates bursty activity while maintaining low latency
+- **400× Spatial Compression**: 320×320 → 16×16 grid using shift-based arithmetic (no dividers)
+- **Dual-Accumulator Sliding Window**: ~400ms observation window with early/late centroid tracking
+- **Motion Vector Extraction**: Explicit geometric motion computation (Δx, Δy)
+- **Threshold-Based Classification**: Cardinal gestures (UP, DOWN, LEFT, RIGHT) without multipliers
+- **Activity Gate**: Minimum event threshold suppresses noise-driven false detections
+- **Persistence Filter**: Requires consistent classification across consecutive windows
+- **Ultra-Low Power**: Dynamic power consumed only in response to incoming events
 
 ## Quick Start
 
@@ -14,8 +26,8 @@ FPGA-based gesture recognition accelerator for Dynamic Vision Sensor (DVS) event
 
 ```powershell
 # Clone the repo
-git clone https://github.com/yourusername/FPGA-Matrix-Multiplication-Accelerator.git
-cd FPGA-Matrix-Multiplication-Accelerator
+git clone https://github.com/jasonwaseq/FPGA-DVS-Gesture-Classifier.git
+cd FPGA-DVS-Gesture-Classifier
 
 # Run setup script (downloads ~300MB FPGA tools)
 .\setup.ps1
@@ -32,8 +44,8 @@ python dvs_camera_emulator.py --preview
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/FPGA-Matrix-Multiplication-Accelerator.git
-cd FPGA-Matrix-Multiplication-Accelerator
+git clone https://github.com/jasonwaseq/FPGA-DVS-Gesture-Classifier.git
+cd FPGA-DVS-Gesture-Classifier
 
 # Run setup script (downloads ~1GB FPGA tools on Linux)
 chmod +x setup.sh
@@ -64,7 +76,7 @@ pip install opencv-python numpy pyserial cocotb pytest
 
 ## Architecture Overview
 
-This is a **real-time gesture recognition system** that processes Dynamic Vision Sensor (DVS) events on an **iCE40 UP5K FPGA**. The system captures motion events from a camera (emulated via webcam), transmits them over UART, and classifies gestures (UP, DOWN, LEFT, RIGHT) using a lightweight centroid-based algorithm.
+This is a **real-time gesture recognition system** that processes Dynamic Vision Sensor (DVS) events on an **iCE40 UP5K FPGA**. The system captures motion events from a camera (emulated via webcam), transmits them over UART, and classifies gestures (UP, DOWN, LEFT, RIGHT) using an asynchronous spatiotemporal motion-energy algorithm.
 
 ### System Block Diagram
 
@@ -79,25 +91,41 @@ This is a **real-time gesture recognition system** that processes Dynamic Vision
 │ └─────────────────┘ │                        │                          │          │
 │         ▲           │                        │                          ▼          │
 │         │           │                        │  ┌────────────────────────────────┐ │
-│ ┌───────┴─────────┐ │   1-byte gesture       │  │     dvs_gesture_accel          │ │
-│ │ Webcam          │ │ ◄───────────────────   │  │  ┌───────────────────────────┐ │ │
-│ │                 │ │   [0xA0 | gesture]     │  │  │ Centroid Accumulators     │ │ │
-│ └─────────────────┘ │                        │  │  │ (Early/Late halves)       │ │ │
-│                     │                        │  │  └───────────────────────────┘ │ │
+│ ┌───────┴─────────┐ │   2-byte gesture       │  │     dvs_gesture_accel          │ │
+│ │ Webcam          │ │ ◄───────────────────   │  │  ┌────────────┐ ┌───────────┐  │ │
+│ │                 │ │   [0xA0|gest, conf]    │  │  │ 16-entry   │ │ Spatial   │  │ │
+│ └─────────────────┘ │                        │  │  │ FIFO       │ │ Compress  │  │ │
+│                     │                        │  │  └──────┬─────┘ └─────┬─────┘  │ │
+│ ┌─────────────────┐ │                        │  │         │             │        │ │
+│ │ FPGA Validator  │ │                        │  │         ▼             ▼        │ │
+│ │ (Python)        │ │                        │  │  ┌─────────────────────────┐   │ │
+│ └─────────────────┘ │                        │  │  │ Dual Accumulators       │   │ │
+│                     │                        │  │  │ (Early/Late windows)    │   │ │
+│                     │                        │  │  │ sum_x, sum_y, count     │   │ │
+│                     │                        │  │  └───────────┬─────────────┘   │ │
 │                     │                        │  │              │                  │ │
 │                     │                        │  │              ▼                  │ │
-│                     │                        │  │  ┌───────────────────────────┐ │ │
-│                     │                        │  │  │ Gesture Classifier        │ │ │
-│                     │                        │  │  │ (delta comparison)        │ │ │
-│                     │                        │  │  └───────────────────────────┘ │ │
-│                     │                        │  └─────────────────┬──────────────┘ │
-│                     │                        │                    ▼                │
+│                     │                        │  │  ┌─────────────────────────┐   │ │
+│                     │                        │  │  │ Motion Vector           │   │ │
+│                     │                        │  │  │ Δx = late_x - early_x   │   │ │
+│                     │                        │  │  │ Δy = late_y - early_y   │   │ │
+│                     │                        │  │  └───────────┬─────────────┘   │ │
+│                     │                        │  │              │                  │ │
+│                     │                        │  │              ▼                  │ │
+│                     │                        │  │  ┌─────────────────────────┐   │ │
+│                     │                        │  │  │ Threshold Classifier    │   │ │
+│                     │                        │  │  │ + Activity Gate         │   │ │
+│                     │                        │  │  │ + Persistence Filter    │   │ │
+│                     │                        │  │  └───────────┬─────────────┘   │ │
+│                     │                        │  └──────────────┼────────────────┘ │
+│                     │                        │                 ▼                  │
 │                     │                        │  ┌──────────┐  ┌────────┐          │
 │                     │                        │  │ uart_tx  │◄─┤ TX FSM │          │
 │                     │                        │  └──────────┘  └────────┘          │
 │                     │                        │                                      │
 │                     │                        │  LEDs: led_heartbeat (~3Hz)         │
 │                     │                        │        led_gesture_valid (pulse)    │
+│                     │                        │        led_activity (event blink)   │
 └─────────────────────┘                        └──────────────────────────────────────┘
 ```
 
@@ -106,77 +134,95 @@ This is a **real-time gesture recognition system** that processes Dynamic Vision
 | Module | File | Description |
 |--------|------|-------------|
 | `uart_gesture_top` | `rtl/uart_gesture_top.sv` | Top-level wrapper, UART protocol, packet parsing |
-| `dvs_gesture_accel` | `rtl/dvs_gesture_accel.sv` | Core accelerator with centroid accumulators |
+| `dvs_gesture_accel` | `rtl/dvs_gesture_accel.sv` | Asynchronous spatiotemporal motion-energy classifier |
 | `uart_rx` | `rtl/uart_rx.sv` | UART receiver (8N1, 115200 baud) |
 | `uart_tx` | `rtl/uart_tx.sv` | UART transmitter (8N1, 115200 baud) |
 
 ### Processing Pipeline
 
 ```
-DVS Events (320×320) → Spatial Compression (16×16) → Temporal Binning (8 bins)
-                    → Centroid Accumulation → Delta Comparison → Gesture Output
+DVS Events (320×320) → FIFO Buffer → Spatial Compression (16×16)
+                    → Dual Accumulators (Early/Late) → Motion Vector Extraction
+                    → Threshold Classification → Persistence Filter → Gesture Output
 ```
 
-#### 1. Spatial Compression (320×320 → 16×16)
+#### 1. Asynchronous FIFO (16 entries)
 
-Events are mapped to a 16×16 grid using fast integer math:
+A shallow FIFO buffers incoming events to tolerate bursty DVS activity while maintaining continuous event-driven operation.
+
+#### 2. Spatial Compression (320×320 → 16×16)
+
+Events are mapped to a 16×16 grid using shift-based arithmetic (no dividers):
 ```
-grid_x = (event_x × 13) >> 8   // Approximates x/20
+grid_x = (event_x × 13) >> 8   // Approximates x/20 (320/16 = 20)
 grid_y = (event_y × 13) >> 8
 ```
 
-#### 2. Temporal Binning (8 bins, 50ms each)
+This achieves 400× spatial dimensionality reduction while retaining coarse motion structure.
 
-The 400ms sliding window is divided into 8 bins:
-- **Early half** (bins 0-3): First 200ms of events
-- **Late half** (bins 4-7): Last 200ms of events
+#### 3. Dual-Accumulator Sliding Window
 
-#### 3. Centroid Accumulators
+Instead of storing per-pixel counters, each accumulator tracks motion statistics:
+- `sum_x`, `sum_y` - Summed positions (signed, relative to center)
+- `count` - Total event count
+- Polarity-separated variants for advanced processing
 
-Instead of storing full voxel tensors (which would require BRAM), we accumulate:
-- `early_sum_x`, `early_sum_y` - Sum of positions in early half
-- `late_sum_x`, `late_sum_y` - Sum of positions in late half
-- `early_count`, `late_count` - Event counts
+The ~400ms observation window is split into:
+- **Early half** (~200ms): First portion of events
+- **Late half** (~200ms): Second portion of events
 
-This allows gesture detection with **zero BRAM usage**.
+This enables direct centroid computation: `centroid = sum / count`
 
-#### 4. Gesture Classification
+#### 4. Motion Vector Extraction
 
-When the temporal window completes:
+At window completion, the motion vector is computed:
 ```
-delta_x = late_sum_x - early_sum_x
-delta_y = late_sum_y - early_sum_y
-
-if |delta_y| > |delta_x|:
-    gesture = DOWN if delta_y > 0 else UP
-else:
-    gesture = LEFT if delta_x > 0 else RIGHT
+Δx = late_sum_x - early_sum_x
+Δy = late_sum_y - early_sum_y
 ```
 
-### Timing Parameters
+This directly encodes dominant direction and magnitude without template matching.
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| Clock | 12 MHz | iCEBreaker oscillator |
-| Bin Period | 50 ms | 600,000 cycles per bin |
-| Window Period | 400 ms | 8 bins total |
-| UART Baud | 115200 | ~87 µs per byte |
+#### 5. Threshold Classification
+
+```
+if total_events >= MIN_EVENT_THRESH:
+    if max(|Δx|, |Δy|) >= MOTION_THRESH:
+        if |Δy| > |Δx|:
+            gesture = DOWN if Δy > 0 else UP
+        else:
+            gesture = RIGHT if Δx > 0 else LEFT
+```
+
+#### 6. Persistence Filter
+
+Requires the same classification decision to hold across multiple consecutive window evaluations before asserting a valid gesture output.
+
+### Configuration Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `CLK_FREQ_HZ` | 12 MHz | iCEBreaker oscillator |
+| `WINDOW_MS` | 400 ms | Total observation window |
+| `MIN_EVENT_THRESH` | 20 | Minimum events for valid gesture |
+| `MOTION_THRESH` | 8 | Minimum motion magnitude |
+| `PERSISTENCE_COUNT` | 2 | Consecutive windows needed |
+| `FIFO_DEPTH` | 16 | Event buffer size |
 
 ### Resource Utilization (iCE40 UP5K)
 
 | Resource | Used | Available | Utilization |
 |----------|------|-----------|-------------|
-| Logic Cells | 685 | 5,280 | **12%** |
+| Logic Cells | ~800 | 5,280 | **~15%** |
 | Block RAM | 0 | 30 | **0%** |
-| I/O Pins | 5 | 96 | 5% |
+| I/O Pins | 6 | 96 | 6% |
 | Global Buffers | 8 | 8 | 100% |
 
-The centroid-based design is extremely lightweight - no BRAM needed!
+The dual-accumulator design is extremely lightweight - no BRAM needed!
 
 ## UART Protocol
 
 **Configuration**: 115200 baud, 8N1
-
 
 ### Send Events to FPGA (5 bytes per event)
 
@@ -190,25 +236,35 @@ The centroid-based design is extremely lightweight - no BRAM needed!
 
 X, Y coordinates range from 0-319.
 
-### Receive from FPGA (1 byte)
+### Receive from FPGA
 
-**Gesture Response**: `0xA0 | gesture`
-- 0xA0 = UP
-- 0xA1 = DOWN  
-- 0xA2 = LEFT
-- 0xA3 = RIGHT
+**Gesture Response** (2 bytes):
+| Byte | Contents |
+|------|----------|
+| 0 | `0xA0 \| gesture` (0=UP, 1=DOWN, 2=LEFT, 3=RIGHT) |
+| 1 | `confidence[3:0] \| event_count_hi[3:0]` |
 
-**Status Response**: `0xB0 | bin`
-- Current temporal bin (0-7)
+**Status Response** (1 byte): `0xBx`
+- Bits [4:2]: FSM state
+- Bit 1: FIFO full
+- Bit 0: FIFO empty
+
+**Config Response** (2 bytes):
+- Byte 0: MIN_EVENT_THRESH
+- Byte 1: MOTION_THRESH
 
 ### Special Commands
 
 | Send | Response | Description |
 |------|----------|-------------|
 | 0xFF | 0x55 | Echo test (verify UART) |
-| 0xFE | 0xBx | Status query (current bin) |
+| 0xFE | 0xBx | Status query |
+| 0xFD | 2 bytes | Config query |
+| 0xFC | (none) | Soft reset |
 
-## DVS Camera Emulator
+## Tools
+
+### DVS Camera Emulator
 
 The `tools/dvs_camera_emulator.py` script converts your laptop webcam into a DVS-like sensor:
 
@@ -217,14 +273,36 @@ The `tools/dvs_camera_emulator.py` script converts your laptop webcam into a DVS
 3. **Generates events** where intensity changed beyond threshold
 4. **Transmits events** via UART to the FPGA
 
-### Modes
-
 | Mode | Command | Description |
 |------|---------|-------------|
 | Preview | `--preview` | Show camera feed with DVS events overlay |
 | Simulate | `--simulate` | Synthetic gestures (no camera needed) |
 | FPGA | `--port /dev/ttyUSB1` | Send events to FPGA |
 | Record | `--save events.bin` | Save events to file |
+
+### FPGA Hardware Validator
+
+The `tools/fpga_gesture_validator.py` script validates the FPGA implementation:
+
+```bash
+# List available serial ports
+python fpga_gesture_validator.py --list-ports
+
+# Basic connection test
+python fpga_gesture_validator.py --port COM3 --test echo
+
+# Test all gestures
+python fpga_gesture_validator.py --port COM3 --test all
+
+# Send specific gesture
+python fpga_gesture_validator.py --port COM3 --gesture right
+
+# Interactive mode
+python fpga_gesture_validator.py --port COM3 --interactive
+
+# Continuous monitoring
+python fpga_gesture_validator.py --port COM3 --continuous --duration 60
+```
 
 ### Tips for Best Gesture Detection
 
@@ -239,13 +317,14 @@ The `tools/dvs_camera_emulator.py` script converts your laptop webcam into a DVS
 ```
 ├── rtl/                        # RTL source files
 │   ├── uart_gesture_top.sv     # Top-level module (UART + accelerator)
-│   ├── dvs_gesture_accel.sv    # Gesture accelerator core
+│   ├── dvs_gesture_accel.sv    # Asynchronous spatiotemporal classifier
 │   ├── uart_rx.sv              # UART receiver (8N1)
 │   └── uart_tx.sv              # UART transmitter (8N1)
 │
 ├── tb/                         # Testbenches
 │   ├── Makefile                # Cocotb simulation makefile
-│   ├── test_dvs_gesture.py     # Main cocotb testbench
+│   ├── test_spatiotemporal_classifier.py  # Main cocotb testbench
+│   ├── test_dvs_gesture.py     # Legacy testbench
 │   └── sim_build/              # Simulation build artifacts
 │
 ├── synth/                      # Synthesis files

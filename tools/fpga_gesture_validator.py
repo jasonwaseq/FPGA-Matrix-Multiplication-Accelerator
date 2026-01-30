@@ -1,0 +1,750 @@
+#!/usr/bin/env python3
+"""
+DVS Gesture Classifier - Hardware Validation Script
+
+This script sends mock DVS events over UART to an iCE40 FPGA running the
+Asynchronous Spatiotemporal Motion-Energy Gesture Classifier and monitors
+for gesture detection responses.
+
+Supported Gestures:
+    - UP    (0x00): Motion from bottom to top
+    - DOWN  (0x01): Motion from top to bottom
+    - LEFT  (0x02): Motion from right to left
+    - RIGHT (0x03): Motion from left to right
+
+UART Protocol:
+    TX (to FPGA):
+        - DVS Event: 5 bytes [X_HI, X_LO, Y_HI, Y_LO, POL]
+        - Echo test: 0xFF -> expects 0x55
+        - Status query: 0xFE -> expects 0xBx
+        - Config query: 0xFD -> expects 2 bytes
+        - Soft reset: 0xFC
+    
+    RX (from FPGA):
+        - Gesture: [0xA0 | gesture, confidence_byte]
+        - Echo: 0x55
+        - Status: 0xBx
+
+Usage:
+    python fpga_gesture_validator.py --port COM3 --gesture right
+    python fpga_gesture_validator.py --port /dev/ttyUSB0 --test all
+    python fpga_gesture_validator.py --port COM3 --interactive
+    python fpga_gesture_validator.py --port COM3 --continuous --duration 60
+
+Requirements:
+    pip install pyserial
+"""
+
+import argparse
+import time
+import sys
+import struct
+import threading
+import queue
+from typing import Optional, List, Tuple
+from dataclasses import dataclass
+from enum import IntEnum
+import random
+import math
+
+try:
+    import serial
+    import serial.tools.list_ports
+except ImportError:
+    print("ERROR: pyserial is required. Install with: pip install pyserial")
+    sys.exit(1)
+
+
+# =============================================================================
+# Constants and Configuration
+# =============================================================================
+
+class Gesture(IntEnum):
+    """Gesture type encodings"""
+    UP = 0
+    DOWN = 1
+    LEFT = 2
+    RIGHT = 3
+
+GESTURE_NAMES = {
+    Gesture.UP: "UP",
+    Gesture.DOWN: "DOWN", 
+    Gesture.LEFT: "LEFT",
+    Gesture.RIGHT: "RIGHT"
+}
+
+# UART settings
+DEFAULT_BAUD_RATE = 115200
+DEFAULT_TIMEOUT = 1.0
+
+# DVS sensor resolution
+SENSOR_WIDTH = 320
+SENSOR_HEIGHT = 320
+
+# Gesture motion parameters
+GESTURE_DURATION_MS = 400  # Duration for gesture motion
+EVENT_RATE_HZ = 500        # Events per second during gesture
+
+
+@dataclass
+class DVSEvent:
+    """Represents a single DVS event"""
+    x: int
+    y: int
+    polarity: int
+    timestamp_us: int = 0
+
+
+@dataclass 
+class GestureResult:
+    """Represents a detected gesture"""
+    gesture: Gesture
+    confidence: int
+    event_count_hi: int
+    raw_bytes: bytes
+
+
+# =============================================================================
+# DVS Event Generation
+# =============================================================================
+
+def generate_gesture_events(
+    gesture: Gesture,
+    duration_ms: float = GESTURE_DURATION_MS,
+    event_rate: float = EVENT_RATE_HZ,
+    center_x: int = 160,
+    center_y: int = 160,
+    motion_amplitude: int = 80,
+    spatial_noise: float = 15.0,
+    noise_ratio: float = 0.05
+) -> List[DVSEvent]:
+    """
+    Generate a stream of DVS events simulating a gesture motion.
+    
+    Args:
+        gesture: Target gesture direction
+        duration_ms: Total duration of gesture in milliseconds
+        event_rate: Average events per second
+        center_x, center_y: Center of motion
+        motion_amplitude: Distance of motion in pixels
+        spatial_noise: Gaussian noise in pixel positions
+        noise_ratio: Fraction of events that are random noise
+    
+    Returns:
+        List of DVSEvent objects
+    """
+    events = []
+    num_events = int(duration_ms * event_rate / 1000)
+    
+    # Define motion trajectory based on gesture
+    if gesture == Gesture.UP:
+        start_x, end_x = center_x, center_x
+        start_y, end_y = center_y + motion_amplitude, center_y - motion_amplitude
+    elif gesture == Gesture.DOWN:
+        start_x, end_x = center_x, center_x
+        start_y, end_y = center_y - motion_amplitude, center_y + motion_amplitude
+    elif gesture == Gesture.LEFT:
+        start_x, end_x = center_x + motion_amplitude, center_x - motion_amplitude
+        start_y, end_y = center_y, center_y
+    elif gesture == Gesture.RIGHT:
+        start_x, end_x = center_x - motion_amplitude, center_x + motion_amplitude
+        start_y, end_y = center_y, center_y
+    else:
+        raise ValueError(f"Unknown gesture: {gesture}")
+    
+    # Generate events along trajectory
+    for i in range(num_events):
+        t = i / max(1, num_events - 1)  # Progress [0, 1]
+        timestamp_us = int(t * duration_ms * 1000)
+        
+        if random.random() < noise_ratio:
+            # Random noise event
+            x = random.randint(0, SENSOR_WIDTH - 1)
+            y = random.randint(0, SENSOR_HEIGHT - 1)
+        else:
+            # Event along trajectory with noise
+            x = start_x + t * (end_x - start_x) + random.gauss(0, spatial_noise)
+            y = start_y + t * (end_y - start_y) + random.gauss(0, spatial_noise)
+            x = int(max(0, min(SENSOR_WIDTH - 1, x)))
+            y = int(max(0, min(SENSOR_HEIGHT - 1, y)))
+        
+        # Mostly ON events for better detection
+        polarity = 1 if random.random() > 0.15 else 0
+        
+        events.append(DVSEvent(x=x, y=y, polarity=polarity, timestamp_us=timestamp_us))
+    
+    return events
+
+
+def generate_random_events(count: int) -> List[DVSEvent]:
+    """Generate random noise events"""
+    events = []
+    for i in range(count):
+        events.append(DVSEvent(
+            x=random.randint(0, SENSOR_WIDTH - 1),
+            y=random.randint(0, SENSOR_HEIGHT - 1),
+            polarity=random.randint(0, 1),
+            timestamp_us=i * 1000
+        ))
+    return events
+
+
+# =============================================================================
+# UART Communication
+# =============================================================================
+
+class FPGAGestureInterface:
+    """Interface for communicating with the FPGA gesture classifier over UART"""
+    
+    def __init__(self, port: str, baud_rate: int = DEFAULT_BAUD_RATE):
+        self.port = port
+        self.baud_rate = baud_rate
+        self.serial: Optional[serial.Serial] = None
+        self.rx_queue = queue.Queue()
+        self.rx_thread: Optional[threading.Thread] = None
+        self.running = False
+        
+    def connect(self) -> bool:
+        """Open serial connection"""
+        try:
+            self.serial = serial.Serial(
+                port=self.port,
+                baudrate=self.baud_rate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=DEFAULT_TIMEOUT
+            )
+            self.running = True
+            self.rx_thread = threading.Thread(target=self._rx_worker, daemon=True)
+            self.rx_thread.start()
+            time.sleep(0.1)  # Allow FPGA to stabilize
+            print(f"Connected to {self.port} at {self.baud_rate} baud")
+            return True
+        except serial.SerialException as e:
+            print(f"ERROR: Failed to open {self.port}: {e}")
+            return False
+    
+    def disconnect(self):
+        """Close serial connection"""
+        self.running = False
+        if self.rx_thread:
+            self.rx_thread.join(timeout=1.0)
+        if self.serial and self.serial.is_open:
+            self.serial.close()
+            print("Disconnected")
+    
+    def _rx_worker(self):
+        """Background thread for receiving UART data"""
+        while self.running:
+            try:
+                if self.serial and self.serial.in_waiting:
+                    data = self.serial.read(self.serial.in_waiting)
+                    for byte in data:
+                        self.rx_queue.put(byte)
+                else:
+                    time.sleep(0.001)
+            except:
+                break
+    
+    def _send_byte(self, byte: int):
+        """Send a single byte"""
+        if self.serial:
+            self.serial.write(bytes([byte & 0xFF]))
+    
+    def _send_bytes(self, data: bytes):
+        """Send multiple bytes"""
+        if self.serial:
+            self.serial.write(data)
+    
+    def _receive_byte(self, timeout: float = 1.0) -> Optional[int]:
+        """Receive a single byte with timeout"""
+        try:
+            return self.rx_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+    
+    def _receive_bytes(self, count: int, timeout: float = 1.0) -> bytes:
+        """Receive multiple bytes"""
+        result = []
+        deadline = time.time() + timeout
+        while len(result) < count and time.time() < deadline:
+            try:
+                byte = self.rx_queue.get(timeout=max(0.001, deadline - time.time()))
+                result.append(byte)
+            except queue.Empty:
+                break
+        return bytes(result)
+    
+    def clear_rx_buffer(self):
+        """Clear any pending received data"""
+        while not self.rx_queue.empty():
+            try:
+                self.rx_queue.get_nowait()
+            except queue.Empty:
+                break
+    
+    # -------------------------------------------------------------------------
+    # UART Commands
+    # -------------------------------------------------------------------------
+    
+    def send_echo(self) -> bool:
+        """Send echo command and verify response"""
+        self.clear_rx_buffer()
+        self._send_byte(0xFF)
+        response = self._receive_byte(timeout=0.5)
+        if response == 0x55:
+            return True
+        print(f"Echo failed: expected 0x55, got {response}")
+        return False
+    
+    def query_status(self) -> Optional[dict]:
+        """Query accelerator status"""
+        self.clear_rx_buffer()
+        self._send_byte(0xFE)
+        response = self._receive_byte(timeout=0.5)
+        if response is None:
+            return None
+        if (response & 0xF0) != 0xB0:
+            print(f"Invalid status response: 0x{response:02X}")
+            return None
+        return {
+            'state': (response >> 2) & 0x07,
+            'fifo_full': (response >> 1) & 0x01,
+            'fifo_empty': response & 0x01,
+            'raw': response
+        }
+    
+    def query_config(self) -> Optional[dict]:
+        """Query configuration parameters"""
+        self.clear_rx_buffer()
+        self._send_byte(0xFD)
+        response = self._receive_bytes(2, timeout=0.5)
+        if len(response) != 2:
+            return None
+        return {
+            'min_event_thresh': response[0],
+            'motion_thresh': response[1]
+        }
+    
+    def soft_reset(self):
+        """Send soft reset command"""
+        self._send_byte(0xFC)
+        time.sleep(0.01)
+    
+    def send_dvs_event(self, event: DVSEvent):
+        """Send a single DVS event"""
+        # Pack 5-byte packet: [X_HI, X_LO, Y_HI, Y_LO, POL]
+        packet = bytes([
+            (event.x >> 8) & 0x01,  # X[8]
+            event.x & 0xFF,          # X[7:0]
+            (event.y >> 8) & 0x01,  # Y[8]
+            event.y & 0xFF,          # Y[7:0]
+            event.polarity & 0x01   # Polarity
+        ])
+        self._send_bytes(packet)
+    
+    def send_event_stream(self, events: List[DVSEvent], delay_us: float = 0):
+        """Send a stream of DVS events with optional inter-event delay"""
+        for event in events:
+            self.send_dvs_event(event)
+            if delay_us > 0:
+                time.sleep(delay_us / 1_000_000)
+    
+    def check_gesture(self, timeout: float = 0.1) -> Optional[GestureResult]:
+        """Check for gesture detection response"""
+        byte1 = self._receive_byte(timeout=timeout)
+        if byte1 is None:
+            return None
+        
+        # Check if this is a gesture response (0xAx)
+        if (byte1 & 0xF0) == 0xA0:
+            byte2 = self._receive_byte(timeout=0.1)
+            if byte2 is None:
+                byte2 = 0
+            
+            gesture = Gesture(byte1 & 0x03)
+            confidence = (byte2 >> 4) & 0x0F
+            event_count_hi = byte2 & 0x0F
+            
+            return GestureResult(
+                gesture=gesture,
+                confidence=confidence,
+                event_count_hi=event_count_hi,
+                raw_bytes=bytes([byte1, byte2])
+            )
+        
+        return None
+
+
+# =============================================================================
+# Test Functions
+# =============================================================================
+
+def test_connection(fpga: FPGAGestureInterface) -> bool:
+    """Test basic UART connectivity"""
+    print("\n" + "="*60)
+    print("TEST: Connection and Echo")
+    print("="*60)
+    
+    if fpga.send_echo():
+        print("✓ Echo test PASSED")
+        return True
+    else:
+        print("✗ Echo test FAILED")
+        return False
+
+
+def test_status(fpga: FPGAGestureInterface) -> bool:
+    """Test status query"""
+    print("\n" + "="*60)
+    print("TEST: Status Query")
+    print("="*60)
+    
+    status = fpga.query_status()
+    if status:
+        print(f"✓ Status: state={status['state']}, "
+              f"fifo_full={status['fifo_full']}, "
+              f"fifo_empty={status['fifo_empty']}")
+        return True
+    else:
+        print("✗ Status query FAILED")
+        return False
+
+
+def test_config(fpga: FPGAGestureInterface) -> bool:
+    """Test configuration query"""
+    print("\n" + "="*60)
+    print("TEST: Configuration Query")
+    print("="*60)
+    
+    config = fpga.query_config()
+    if config:
+        print(f"✓ Config: min_event_thresh={config['min_event_thresh']}, "
+              f"motion_thresh={config['motion_thresh']}")
+        return True
+    else:
+        print("✗ Config query FAILED")
+        return False
+
+
+def test_gesture(fpga: FPGAGestureInterface, gesture: Gesture, 
+                 num_events: int = 200, verbose: bool = True) -> Optional[GestureResult]:
+    """Test a specific gesture"""
+    gesture_name = GESTURE_NAMES[gesture]
+    
+    if verbose:
+        print(f"\n" + "="*60)
+        print(f"TEST: {gesture_name} Gesture")
+        print("="*60)
+    
+    # Reset before test
+    fpga.soft_reset()
+    fpga.clear_rx_buffer()
+    time.sleep(0.05)
+    
+    # Generate gesture events
+    events = generate_gesture_events(gesture, event_rate=EVENT_RATE_HZ * 2, 
+                                     duration_ms=GESTURE_DURATION_MS)
+    
+    if verbose:
+        print(f"Sending {len(events)} events for {gesture_name} gesture...")
+    
+    # Send events with realistic timing
+    # Split into early and late portions for the dual-accumulator architecture
+    half = len(events) // 2
+    
+    # Early window events
+    fpga.send_event_stream(events[:half], delay_us=500)
+    time.sleep(0.2)  # Wait for phase transition
+    
+    # Late window events  
+    fpga.send_event_stream(events[half:], delay_us=500)
+    
+    # Wait for classification with persistence
+    time.sleep(0.5)
+    
+    # Check for gesture response
+    result = fpga.check_gesture(timeout=1.0)
+    
+    if result:
+        detected_name = GESTURE_NAMES[result.gesture]
+        if verbose:
+            print(f"✓ Gesture detected: {detected_name} "
+                  f"(confidence={result.confidence}, expected={gesture_name})")
+        if result.gesture == gesture:
+            if verbose:
+                print(f"  CORRECT classification!")
+            return result
+        else:
+            if verbose:
+                print(f"  INCORRECT - expected {gesture_name}")
+            return result
+    else:
+        if verbose:
+            print(f"✗ No gesture detected (expected {gesture_name})")
+        return None
+
+
+def test_all_gestures(fpga: FPGAGestureInterface) -> dict:
+    """Test all four gesture directions"""
+    print("\n" + "="*60)
+    print("TEST: All Gestures")
+    print("="*60)
+    
+    results = {}
+    for gesture in Gesture:
+        result = test_gesture(fpga, gesture, verbose=True)
+        results[gesture] = result
+        time.sleep(0.5)
+    
+    # Summary
+    print("\n" + "-"*60)
+    print("SUMMARY:")
+    correct = sum(1 for g, r in results.items() if r and r.gesture == g)
+    print(f"  Correct: {correct}/4")
+    for gesture, result in results.items():
+        name = GESTURE_NAMES[gesture]
+        if result:
+            detected = GESTURE_NAMES[result.gesture]
+            status = "✓" if result.gesture == gesture else "✗"
+            print(f"  {status} {name}: detected {detected} (conf={result.confidence})")
+        else:
+            print(f"  ✗ {name}: no detection")
+    
+    return results
+
+
+def test_noise_rejection(fpga: FPGAGestureInterface) -> bool:
+    """Test that random noise doesn't trigger false gestures"""
+    print("\n" + "="*60)
+    print("TEST: Noise Rejection")
+    print("="*60)
+    
+    fpga.soft_reset()
+    fpga.clear_rx_buffer()
+    
+    # Send random noise events (below activity threshold)
+    events = generate_random_events(10)
+    print(f"Sending {len(events)} random noise events...")
+    fpga.send_event_stream(events, delay_us=1000)
+    
+    time.sleep(0.5)
+    
+    result = fpga.check_gesture(timeout=0.5)
+    if result:
+        print(f"✗ False detection: {GESTURE_NAMES[result.gesture]}")
+        return False
+    else:
+        print("✓ No false detection - noise rejection working")
+        return True
+
+
+def continuous_monitoring(fpga: FPGAGestureInterface, duration_s: float = 60):
+    """Monitor for gestures continuously"""
+    print("\n" + "="*60)
+    print(f"Continuous Monitoring ({duration_s}s)")
+    print("="*60)
+    print("Listening for gesture detections... (Press Ctrl+C to stop)")
+    
+    start_time = time.time()
+    gesture_count = {g: 0 for g in Gesture}
+    
+    try:
+        while (time.time() - start_time) < duration_s:
+            result = fpga.check_gesture(timeout=0.1)
+            if result:
+                name = GESTURE_NAMES[result.gesture]
+                gesture_count[result.gesture] += 1
+                elapsed = time.time() - start_time
+                print(f"[{elapsed:6.1f}s] Detected: {name} "
+                      f"(confidence={result.confidence})")
+            time.sleep(0.01)
+    except KeyboardInterrupt:
+        print("\nStopped by user")
+    
+    # Summary
+    print("\n" + "-"*60)
+    print("DETECTION SUMMARY:")
+    total = sum(gesture_count.values())
+    print(f"  Total gestures: {total}")
+    for gesture, count in gesture_count.items():
+        print(f"  {GESTURE_NAMES[gesture]}: {count}")
+
+
+def interactive_mode(fpga: FPGAGestureInterface):
+    """Interactive testing mode"""
+    print("\n" + "="*60)
+    print("Interactive Mode")
+    print("="*60)
+    print("Commands:")
+    print("  u/d/l/r - Send UP/DOWN/LEFT/RIGHT gesture")
+    print("  e       - Echo test")
+    print("  s       - Status query")
+    print("  c       - Config query")
+    print("  x       - Soft reset")
+    print("  n       - Send noise events")
+    print("  a       - Test all gestures")
+    print("  q       - Quit")
+    print()
+    
+    while True:
+        try:
+            cmd = input("Command> ").strip().lower()
+            
+            if cmd == 'q':
+                break
+            elif cmd == 'e':
+                if fpga.send_echo():
+                    print("Echo: OK")
+                else:
+                    print("Echo: FAILED")
+            elif cmd == 's':
+                status = fpga.query_status()
+                if status:
+                    print(f"Status: {status}")
+                else:
+                    print("Status: FAILED")
+            elif cmd == 'c':
+                config = fpga.query_config()
+                if config:
+                    print(f"Config: {config}")
+                else:
+                    print("Config: FAILED")
+            elif cmd == 'x':
+                fpga.soft_reset()
+                print("Reset sent")
+            elif cmd == 'u':
+                test_gesture(fpga, Gesture.UP)
+            elif cmd == 'd':
+                test_gesture(fpga, Gesture.DOWN)
+            elif cmd == 'l':
+                test_gesture(fpga, Gesture.LEFT)
+            elif cmd == 'r':
+                test_gesture(fpga, Gesture.RIGHT)
+            elif cmd == 'n':
+                test_noise_rejection(fpga)
+            elif cmd == 'a':
+                test_all_gestures(fpga)
+            elif cmd:
+                print(f"Unknown command: {cmd}")
+                
+        except KeyboardInterrupt:
+            print("\n")
+            break
+        except EOFError:
+            break
+
+
+def list_ports():
+    """List available serial ports"""
+    ports = serial.tools.list_ports.comports()
+    if not ports:
+        print("No serial ports found")
+    else:
+        print("Available serial ports:")
+        for port in ports:
+            print(f"  {port.device}: {port.description}")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="DVS Gesture Classifier FPGA Hardware Validator",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --list-ports
+  %(prog)s --port COM3 --test echo
+  %(prog)s --port COM3 --gesture right
+  %(prog)s --port COM3 --test all
+  %(prog)s --port COM3 --interactive
+  %(prog)s --port /dev/ttyUSB0 --continuous --duration 120
+        """
+    )
+    
+    parser.add_argument('--port', '-p', type=str,
+                        help='Serial port (e.g., COM3 or /dev/ttyUSB0)')
+    parser.add_argument('--baud', '-b', type=int, default=DEFAULT_BAUD_RATE,
+                        help=f'Baud rate (default: {DEFAULT_BAUD_RATE})')
+    parser.add_argument('--list-ports', action='store_true',
+                        help='List available serial ports')
+    parser.add_argument('--test', '-t', type=str, 
+                        choices=['echo', 'status', 'config', 'noise', 'all'],
+                        help='Run specific test')
+    parser.add_argument('--gesture', '-g', type=str,
+                        choices=['up', 'down', 'left', 'right'],
+                        help='Send specific gesture')
+    parser.add_argument('--interactive', '-i', action='store_true',
+                        help='Interactive testing mode')
+    parser.add_argument('--continuous', '-c', action='store_true',
+                        help='Continuous gesture monitoring')
+    parser.add_argument('--duration', '-d', type=float, default=60,
+                        help='Duration for continuous monitoring (seconds)')
+    
+    args = parser.parse_args()
+    
+    if args.list_ports:
+        list_ports()
+        return 0
+    
+    if not args.port:
+        parser.print_help()
+        print("\nERROR: --port is required")
+        return 1
+    
+    # Connect to FPGA
+    fpga = FPGAGestureInterface(args.port, args.baud)
+    if not fpga.connect():
+        return 1
+    
+    try:
+        # Initial connection test
+        if not test_connection(fpga):
+            print("WARNING: Echo test failed, FPGA may not be responding")
+        
+        # Run requested operation
+        if args.test == 'echo':
+            test_connection(fpga)
+        elif args.test == 'status':
+            test_status(fpga)
+        elif args.test == 'config':
+            test_config(fpga)
+        elif args.test == 'noise':
+            test_noise_rejection(fpga)
+        elif args.test == 'all':
+            test_status(fpga)
+            test_config(fpga)
+            test_noise_rejection(fpga)
+            test_all_gestures(fpga)
+        elif args.gesture:
+            gesture_map = {
+                'up': Gesture.UP,
+                'down': Gesture.DOWN,
+                'left': Gesture.LEFT,
+                'right': Gesture.RIGHT
+            }
+            test_gesture(fpga, gesture_map[args.gesture])
+        elif args.continuous:
+            continuous_monitoring(fpga, args.duration)
+        elif args.interactive:
+            interactive_mode(fpga)
+        else:
+            # Default: run all tests
+            test_status(fpga)
+            test_config(fpga)
+            test_all_gestures(fpga)
+        
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    finally:
+        fpga.disconnect()
+    
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
